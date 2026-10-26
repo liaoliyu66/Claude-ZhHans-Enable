@@ -1,44 +1,349 @@
 #!/bin/bash
 set -euo pipefail
-mode="${1:-}"
-if [[ -z "$mode" ]]; then
-    printf '\nClaude 简体中文界面工具\n'
-    printf '%s\n' '1) 设置中文' '2) 还原最近一次备份' '0) 退出'
-    printf '请选择 [1/2/0]: '
-    if ! IFS= read -r choice; then
-        printf '\n未读取到选项，已退出。\n'
-        exit 2
-    fi
-    case "$choice" in
-        1) mode="install" ;;
-        2)
-            printf '将还原最近一次安装备份。继续？[y/N]: '
-            if ! IFS= read -r confirm || [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-                printf '已取消还原。\n'
-                exit 0
-            fi
-            mode="--restore"
-            ;;
-        0) printf '已退出。\n'; exit 0 ;;
-        *) printf '选项无效，请输入 1、2 或 0。\n' >&2; exit 2 ;;
-    esac
-fi
-case "$mode" in
-    --help|-h|help)
-        printf '%s\n' '用法：Claude-ZhHans-Enable.command [--dry-run|--restore|--help]' \
-            '不带参数启动时显示中文菜单。--restore 会还原最近一次安装备份。'
-        exit 0
-        ;;
-esac
-exec /usr/bin/python3 - "$0" "$mode" <<'PYINSTALL'
+run_tool() {
+    /usr/bin/python3 - "$0" "$1" <<'PYINSTALL'
 from __future__ import annotations
-import base64, datetime, gzip, hashlib, json, os, plistlib, re, shlex, shutil, subprocess, sys, tempfile
+import base64, datetime, gzip, hashlib, json, os, plistlib, re, shlex, shutil, struct, subprocess, sys, tempfile, zipfile
 from pathlib import Path
 
 installer=Path(sys.argv[1]).resolve()
 mode=sys.argv[2]
-if mode not in ("install","--dry-run","--restore"):
-    print("用法：Claude-ZhHans-Enable.command [--dry-run|--restore|--help]",file=sys.stderr); raise SystemExit(2)
+CU_MODES=("cu-install","cu-check","cu-restore")
+if mode not in ("install","--dry-run","--restore")+CU_MODES:
+    print("用法：Claude-ZhHans-Enable.command [--dry-run|--restore|cu-install|cu-check|cu-restore|--help]",file=sys.stderr); raise SystemExit(2)
+
+# ---------------- 计算机使用（CU）强开 ----------------
+CU_APP=Path(os.environ.get("CLAUDE_APP_PATH","/Applications/Claude.app")).expanduser().resolve()
+CU_SAFE_ENT={
+ "com.apple.security.automation.apple-events":True,"com.apple.security.cs.allow-jit":True,
+ "com.apple.security.device.audio-input":True,"com.apple.security.device.bluetooth":True,
+ "com.apple.security.device.camera":True,"com.apple.security.device.print":True,
+ "com.apple.security.device.usb":True,"com.apple.security.personal-information.location":True,
+ "com.apple.security.personal-information.photos-library":True,"com.apple.security.virtualization":True}
+# Claude 3.6556.2 实测：CDr() 仍是 `return!1`（服务端 chicago_config.enabled=false 时
+# KH() 直接返回 false，qH()=KH()&&chicagoEnabled 恒假），删掉这条补丁会让 CU 彻底关闭。
+# 卡住 CU 的两处：
+#   1) YH() 里的 macOS 版本上限与 GrowthBook 新鲜度门槛（27.x 被判 os_version_too_new）
+#   2) CDr() 总开关硬编码 !1，关闭时所有子门控（KH/qH/ADr/ZH）一起失效
+CU_GATE_OLD = b"n.major<15||_Dr(n,gDr())||t&&!GH()"
+CU_GATE_NEW = b"!1" + b" " * (len(CU_GATE_OLD) - 2)
+#   3) YH() 末尾 appScopedEnabled 默认值（3.6556.2 实测仍是 !1，后台模式需改为 !0）
+CU_MASTER_OLD = b"function CDr(){return!1}"
+CU_MASTER_NEW = b"function CDr(){return!0}"
+CU_SCOPED_OLD = b'Ub(WH,"appScopedEnabled",!1,O())'
+CU_SCOPED_NEW = b'Ub(WH,"appScopedEnabled",!0,O())'
+CU_PATCHES=[(CU_MASTER_OLD, CU_MASTER_NEW), (CU_GATE_OLD, CU_GATE_NEW), (CU_SCOPED_OLD, CU_SCOPED_NEW)]
+CU_BK=Path.home()/"Library/Application Support/Claude-CU-Backups"
+# 只保留最初一份官方原版：补丁状态由版本号区分，同版本不会重复生成快照。
+def cu_pristine_name(ver):
+    return "Claude-"+str(ver).replace("/","_")+"-原版"
+
+def cu_snapshot(ver):
+    """返回最初原版快照路径；已存在则直接复用，不再复制一份 59 MB 的 asar。"""
+    d=CU_BK/cu_pristine_name(ver)
+    return d if (d/"app.asar").is_file() else None
+
+def cu_newer_backups(ver):
+    """列出除最初原版外、同一 Claude 版本留下的其他快照。"""
+    keep=cu_pristine_name(ver); out=[]
+    for p in CU_BK.glob("*"):
+        if p.name==keep or not p.is_dir() or not (p/"app.asar").is_file(): continue
+        out.append(p)
+    return sorted(out,key=lambda p:p.name)
+
+def cu_paths():
+    return (CU_APP/"Contents/Resources/app.asar", CU_APP/"Contents/Info.plist")
+
+def cu_read(asar):
+    raw=bytearray(asar.read_bytes())
+    _a,hp,_c,jl=struct.unpack("<IIII",bytes(raw[:16]))
+    hdr=bytes(raw[16:16+jl])
+    return raw,hdr,8+hp,json.loads(hdr)
+
+def cu_gate(raw,base,header):
+    for name,node in header["files"][".vite"]["files"]["build"]["files"].items():
+        if not name.endswith(".js") or "integrity" not in node: continue
+        off,size=int(node["offset"]),int(node["size"])
+        blob=bytes(raw[base+off:base+off+size])
+        if b"function YH(e={}){" in blob: return name,node,base+off,size,blob
+    raise RuntimeError("未找到 CU 开关，Claude 版本可能已变化")
+
+def cu_version(plist=None):
+    try:
+        plist=plist or cu_paths()[1]
+        return plistlib.loads(Path(plist).read_bytes()).get("CFBundleShortVersionString","?")
+    except Exception:
+        return "?"
+
+def cu_plist_hash(plist):
+    pl=plist.read_bytes()
+    m=re.search(rb"<key>ElectronAsarIntegrity</key>[\s\S]{0,300}?<key>hash</key>\s*<string>([0-9a-f]{64})</string>",pl)
+    return m.group(1).decode() if m else ""
+
+def _cu_data_dir():
+    """返回应用真正使用的 userData 目录。本项目安装为 Claude-3p，官方包为 Claude。"""
+    env=os.environ.get("CLAUDE_USER_DATA_DIR")
+    if env: return Path(env).expanduser()
+    root=Path.home()/"Library/Application Support"
+    # 依据日志中实际加载的目录判定，Claude-3p 优先
+    for name in ("Claude-3p","Claude"):
+        d=root/name
+        if (d/"claude_desktop_config.json").exists(): return d
+    return root/"Claude"
+
+def cu_prefs(enable=None):
+    cfg=Path(os.environ.get("CLAUDE_USER_DATA_DIR",str(_cu_data_dir()))).expanduser()/"claude_desktop_config.json"
+    if enable is None:
+        try: return json.loads(cfg.read_text(encoding="utf-8")).get("preferences",{})
+        except Exception: return {}
+    if not cfg.exists():
+        print(f"  警告：配置文件不存在，未写入偏好：{cfg}")
+        return {}
+    d=json.loads(cfg.read_text(encoding="utf-8")); p=d.setdefault("preferences",{})
+    if enable:
+        p["chicagoEnabled"]=True
+        # 目标是「后台」模式：继续使用计算机时不在前台抢占屏幕
+        p["chicagoPreferredMode"]=os.environ.get("CLAUDE_CU_PREFERRED_MODE","background")
+        p.setdefault("chicagoAutoUnhide",True)
+    else:
+        for k in ("chicagoEnabled","chicagoPreferredMode","chicagoAutoUnhide"): p.pop(k,None)
+    cfg.write_text(json.dumps(d,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+    return p
+
+def cu_running():
+    """检测 Claude 主进程是否存活。
+
+    不用 pgrep：在某些系统状态下 pgrep 查不到进程（实测 macOS 27 上
+    pgrep -f/-x/-l 对已进入退出流程的 Claude 全部返回空），会误判为已退出，
+    从而让安装脚本在旧进程仍持有旧 asar 时继续执行。
+    """
+    exe=str((CU_APP/"Contents/MacOS/Claude").resolve())
+    try:
+        out=subprocess.run(["ps","-Ao","pid=,command="],text=True,capture_output=True,timeout=10).stdout
+    except Exception:
+        return False
+    for line in out.splitlines():
+        line=line.strip()
+        if not line: continue
+        pid,_,cmd=line.partition(" ")
+        if cmd.strip()==exe: return True
+    return False
+
+def cu_quit(wait=15.0):
+    """退出 Claude 并确认主进程确实消失。
+
+    顺序：AppleScript quit -> SIGTERM -> SIGKILL。
+    每一步都以 cu_running() 的真实存活状态为准，不做乐观假设。
+    """
+    import time as _t
+    if not cu_running(): return True
+    subprocess.run(["osascript","-e",'tell application "Claude" to quit'],capture_output=True)
+    deadline=_t.time()+wait
+    while _t.time()<deadline:
+        if not cu_running(): return True
+        _t.sleep(0.5)
+    # 仍未退出，发 SIGTERM
+    print("  正常退出未完成，发送 SIGTERM…")
+    for pid in _cu_pids():
+        subprocess.run(["kill","-TERM",str(pid)],capture_output=True)
+    deadline=_t.time()+5
+    while _t.time()<deadline:
+        if not cu_running(): return True
+        _t.sleep(0.5)
+    # 最后手段
+    print("  SIGTERM 未生效，发送 SIGKILL…")
+    for pid in _cu_pids():
+        subprocess.run(["kill","-9",str(pid)],capture_output=True)
+    deadline=_t.time()+5
+    while _t.time()<deadline:
+        if not cu_running(): return True
+        _t.sleep(0.5)
+    return not cu_running()
+
+def _cu_pids():
+    """返回 Claude 主进程的全部 PID（与 cu_running 同一判定口径）。"""
+    exe=str((CU_APP/"Contents/MacOS/Claude").resolve())
+    try:
+        out=subprocess.run(["ps","-Ao","pid=,command="],text=True,capture_output=True,timeout=10).stdout
+    except Exception:
+        return []
+    pids=[]
+    for line in out.splitlines():
+        line=line.strip()
+        if not line: continue
+        pid,_,cmd=line.partition(" ")
+        if cmd.strip()==exe:
+            try: pids.append(int(pid))
+            except ValueError: pass
+    return pids
+
+def cu_resign(log=print):
+    ent=Path(tempfile.gettempdir())/"claude-cu-ent.plist"
+    with open(ent,"wb") as f: plistlib.dump(CU_SAFE_ENT,f)
+    files=[]
+    for r,_d,fs in os.walk(CU_APP/"Contents"):
+        for n in fs:
+            q=Path(r)/n
+            try:
+                with open(q,"rb") as fh: magic=fh.read(4)
+            except OSError: continue
+            if magic in (b"\xcf\xfa\xed\xfe",b"\xce\xfa\xed\xfe"): files.append(q)
+    for q in sorted(files,key=lambda x:len(str(x)),reverse=True):
+        subprocess.run(["codesign","--force","--sign","-","--timestamp=none",str(q)],capture_output=True)
+    bundles=[]
+    for r,ds,_f in os.walk(CU_APP/"Contents"):
+        for d in ds:
+            if d.endswith((".app",".framework",".xpc")): bundles.append(Path(r)/d)
+    for b in sorted(bundles,key=lambda x:len(str(x)),reverse=True):
+        subprocess.run(["codesign","--force","--sign","-","--timestamp=none",str(b)],capture_output=True)
+    subprocess.run(["codesign","--force","--sign","-","--timestamp=none","--entitlements",str(ent),str(CU_APP)],capture_output=True)
+    rc=subprocess.run(["codesign","--verify","--deep","--strict",str(CU_APP)],capture_output=True).returncode
+    log("  重签名：" + ("通过" if rc==0 else "失败"))
+    return rc==0
+
+def cu_state():
+    asar,plist=cu_paths()
+    raw,hdr,base,header=cu_read(asar)
+    name,node,start,size,blob=cu_gate(raw,base,header)
+    try: ver=plistlib.loads(plist.read_bytes()).get("CFBundleShortVersionString","?")
+    except Exception: ver="?"
+    return {"version":ver,"chunk":name,
+            "master":CU_MASTER_NEW in blob,
+            "scoped":CU_GATE_NEW in blob,
+            "appscoped":CU_SCOPED_NEW in blob,
+            "file_ok":hashlib.sha256(blob).hexdigest()==node["integrity"]["hash"],
+            "hdr_ok":hashlib.sha256(hdr).hexdigest()==cu_plist_hash(plist),
+            "prefs":cu_prefs()}
+
+def cu_do_check():
+    s=cu_state()
+    print(f"Claude 版本：{s['version']}")
+    print(f"开关位置：{s['chunk']}")
+    print(f"  总开关 CDr()       ：{'已开启' if s['master'] else '官方原版'}")
+    print(f"  版本门槛 YH()      ：{'已移除' if s['scoped'] else '仍拦截（27.x 被判 os_version_too_new）'}")
+    print(f"  后台模式 appScoped ：{'已开启' if s['appscoped'] else '默认关闭'}")
+    print(f"  asar 内容校验      ：{'一致' if s['file_ok'] else '不一致'}")
+    print(f"  plist header 校验  ：{'一致' if s['hdr_ok'] else '不一致'}")
+    print(f"  配置文件           ：{_cu_data_dir()/'claude_desktop_config.json'}")
+    print(f"  chicagoEnabled     ：{s['prefs'].get('chicagoEnabled')}")
+    print(f"  chicagoPreferredMode：{s['prefs'].get('chicagoPreferredMode')}")
+    if s["master"] and s["scoped"] and s["appscoped"] and s["file_ok"] and s["hdr_ok"]:
+        print("结论：CU 已开启，配置一致。")
+    else:
+        print("结论：CU 未开启或配置不一致，可执行「开启计算机使用」。")
+    return 0
+
+def cu_do_install():
+    if not cu_quit(): raise RuntimeError("Claude 未能退出，请手动退出后重试")
+    asar,plist=cu_paths()
+    raw,hdr,base,header=cu_read(asar)
+    name,node,start,size,blob=cu_gate(raw,base,header)
+    if all(blob.count(new)==1 for _old,new in CU_PATCHES):
+        print("CU 开关已是开启状态，跳过写入。")
+        cu_resign(); cu_prefs(True); return 0
+    old_hash=node["integrity"]["hash"]; old_blocks=list(node["integrity"]["blocks"]); bs=int(node["integrity"]["blockSize"])
+    if hashlib.sha256(blob).hexdigest()!=old_hash:
+        raise RuntimeError("asar 内容与 integrity 不一致，请先重装 Claude")
+    # 确认要写入后才备份；同版本只保留最初一份官方原版，不再重复复制。
+    ver=cu_version(plist)
+    CU_BK.mkdir(parents=True,exist_ok=True)
+    bk=cu_snapshot(ver)
+    if bk: print("已保留最初原版："+str(bk))
+    else:
+        bk=CU_BK/cu_pristine_name(ver); bk.mkdir()
+        shutil.copy2(asar,bk/"app.asar"); shutil.copy2(plist,bk/"Info.plist")
+        print("已备份最初原版："+str(bk))
+    for old in cu_newer_backups(ver):
+        shutil.rmtree(old,ignore_errors=True)
+        print("已清理重复备份："+old.name)
+    region=bytearray(blob)
+    for old,new in CU_PATCHES:
+        # 幂等：已打过补丁的 asar（例如只补了 YH、没补 CDr 的旧版本脚本产物）跳过该条
+        if region.count(old)==0 and region.count(new)==1: continue
+        if region.count(old)!=1: raise RuntimeError("开关定位失败，Claude 版本可能已变化："+old.decode())
+        region=bytearray(bytes(region).replace(old,new))
+    nh=hashlib.sha256(bytes(region)).hexdigest()
+    nb=[hashlib.sha256(bytes(region[i:i+bs])).hexdigest() for i in range(0,size,bs)]
+    h=bytearray(hdr); h=bytearray(bytes(h).replace(old_hash.encode(),nh.encode()))
+    for o,nw in zip(old_blocks,nb):
+        if h.count(o.encode())!=1: raise RuntimeError("integrity 块定位失败")
+        h=bytearray(bytes(h).replace(o.encode(),nw.encode()))
+    if len(h)!=len(hdr): raise RuntimeError("asar header 长度变化，已中止")
+    out=bytearray(raw); out[16:16+len(h)]=h; out[start:start+size]=region
+    fd,tmp=tempfile.mkstemp(dir=str(asar.parent),prefix=".cu-")
+    os.close(fd)
+    Path(tmp).write_bytes(out); shutil.copymode(asar,tmp); os.replace(tmp,asar)
+    hh=hashlib.sha256(bytes(h)).hexdigest()
+    pl=plist.read_bytes()
+    m=re.search(rb"<key>ElectronAsarIntegrity</key>[\s\S]{0,300}?<key>hash</key>\s*<string>([0-9a-f]{64})</string>",pl)
+    if not m: raise RuntimeError("Info.plist 缺少 ElectronAsarIntegrity")
+    with open(plist,"r+b") as f:
+        f.write(pl.replace(m.group(1),hh.encode(),1)); f.flush(); f.truncate()
+    print("已写入 CU 开关："+name)
+    cu_resign()
+    cu_prefs(True)
+    print("完成。启动 Claude 后到「设置 → 系统 → 计算机使用」查看。")
+    print("提示：重签名后需要重新登录一次，登录态不会反复丢失。")
+    return 0
+
+def cu_do_restore():
+    dirs=sorted([p for p in CU_BK.glob("*") if p.is_dir() and (p/"app.asar").is_file()],key=lambda p:p.name)
+    zips=sorted([p for p in CU_BK.glob("*.zip")],key=lambda p:p.name)
+    if not dirs and not zips: raise RuntimeError("没有可用的 CU 备份："+str(CU_BK))
+    if not cu_quit(): raise RuntimeError("Claude 未能退出，请手动退出后重试")
+    asar,plist=cu_paths()
+    ver=cu_version(plist)
+    # 优先用最初原版；没有时才退回按时间戳取最新一份（兼容旧备份命名）。
+    keep=cu_snapshot(ver)
+    # 旧备份目录名形如 20261025-015148-Claude-CU，时间戳是前 15 个字符（YYYYMMDD-HHMMSS）。
+    # 旧实现用 name[:8] 与 zip 的 stem[-8:] 相比，单位不一致，会选错备份。
+    def _bk_ts(name):
+        m=re.match(r"(\d{8}-\d{6})",name)
+        return m.group(1) if m else ""
+
+    dir_cand=[( _bk_ts(p.name), "dir", p) for p in dirs if p!=keep]
+    zip_cand=[( _bk_ts(p.stem), "zip", p) for p in zips]
+    cand=[c for c in dir_cand+zip_cand if c[0]]
+    if keep:
+        kind,bk="dir",keep
+        print("使用最初原版备份："+str(bk))
+    elif cand:
+        _ts,kind,bk=max(cand,key=lambda c:c[0])
+    else:
+        raise RuntimeError("备份文件名中没有可识别的时间戳："+str(CU_BK))
+    if kind=="dir":
+        shutil.copy2(bk/"app.asar",asar); shutil.copy2(bk/"Info.plist",plist)
+    else:
+        with zipfile.ZipFile(bk) as z:
+            asar.write_bytes(z.read("app.asar"))
+            plist.write_bytes(z.read("Info.plist"))
+    print("已还原："+str(bk))
+    cu_resign()
+    cu_prefs(False)
+    # 最初原版保留；其余同版本快照还原后清掉，清空则移除备份目录。
+    try:
+        if bk!=keep:
+            if bk.is_dir(): shutil.rmtree(bk)
+            else: bk.unlink()
+            print("已清理备份："+str(bk.name))
+        for old in cu_newer_backups(ver):
+            if old==bk: continue
+            shutil.rmtree(old,ignore_errors=True)
+            print("已清理重复备份："+old.name)
+        if CU_BK.is_dir() and not any(p for p in CU_BK.iterdir() if p.name!=".DS_Store"):
+            shutil.rmtree(CU_BK,ignore_errors=True)
+    except OSError as exc:
+        print("警告：备份清理失败，可手动删除（"+str(exc)+"）",file=sys.stderr)
+    print("完成。已恢复官方 asar 与偏好设置。")
+    print("已保留最初原版备份："+str(keep) if keep else "提示：未找到最初原版备份，本次已用其他快照还原。")
+    return 0
+
+if mode in CU_MODES:
+    try:
+        raise SystemExit({"cu-check":cu_do_check,"cu-install":cu_do_install,"cu-restore":cu_do_restore}[mode]())
+    except Exception as exc:
+        print("错误："+str(exc),file=sys.stderr); raise SystemExit(1)
+
 src=installer.read_text(encoding="utf-8")
 def embedded(name):
     m=re.search(r"(?ms)^# BEGIN_"+re.escape(name)+r"\n(.*?)^# END_"+re.escape(name)+r"$",src)
@@ -63,7 +368,7 @@ shared=[]; labels=[]
 for p in assets_dir.glob("*.js"):
     try: s=p.read_text(encoding="utf-8")
     except Exception: continue
-    if "var jv=[" in s and 'var Gv="en-US",Kv=[' in s: shared.append((p,s))
+    if "var ay=[" in s and 'var yy="en-US",by=[' in s: shared.append((p,s))
     if '"ja-JP":{name:"Japanese (Japan)"' in s and '"zh-Hant":{name:"Chinese (Traditional)"' in s and 'function M(e,t={})' in s: labels.append((p,s))
 if len(shared)!=1: raise RuntimeError(f"未能唯一定位语言注册脚本（找到 {len(shared)} 个），未修改文件。")
 if len(labels)!=1: raise RuntimeError(f"未能唯一定位语言名称脚本（找到 {len(labels)} 个），未修改文件。")
@@ -75,8 +380,8 @@ def add_locale(text,pattern,locale,what):
     if locale in vals: return text,False
     updated=m.group(1)+("," if m.group(1) else "")+'"'+locale+'"'
     return text[:m.start(1)]+updated+text[m.end(1):],True
-shared_text,jv_changed=add_locale(shared_text,r'var\s+jv=\[([^\]]*)\]',"zh-Hans","renderer")
-shared_text,kv_changed=add_locale(shared_text,r'var\s+Gv="en-US",Kv=\[([^\]]*)\]',"zh-Hans","system-language")
+shared_text,ay_changed=add_locale(shared_text,r'var\s+ay=\[([^\]]*)\]',"zh-Hans","renderer")
+shared_text,by_changed=add_locale(shared_text,r'var\s+yy="en-US",by=\[([^\]]*)\]',"zh-Hans","system-language")
 marker="function M(e,t={})"
 if label_text.count(marker)!=1: raise RuntimeError("语言名称表结构已变化，未修改文件。")
 prefix,rest=label_text.split(marker,1)
@@ -105,7 +410,7 @@ if mode=="--restore":
 else:
     print(f"Claude 版本：{version}；程序路径：{app}")
     print(f"简体中文语言包：{len(zh_obj)} 项；动态语言包：{len(dyn_obj)} 项")
-    print(f"语言注册：选择器={'新增' if jv_changed else '已存在'}；系统自动识别={'新增' if kv_changed else '已存在'}；中文名称={'新增' if name_changed else '已存在'}")
+    print(f"语言注册：选择器={'新增' if ay_changed else '已存在'}；系统自动识别={'新增' if by_changed else '已存在'}；中文名称={'新增' if name_changed else '已存在'}")
     for p in planned: print(("将写入：" if p in changed else "无需改动：")+str(p))
 if mode=="--dry-run": print("预览完成，未修改任何文件。"); raise SystemExit(0)
 
@@ -125,26 +430,64 @@ def running_for_user_data():
     return False
 if running_for_user_data():
     raise RuntimeError("对应的 Claude-3p 进程当前正在运行。请完全退出 Claude 后重新执行。")
+def _locale_backups():
+    return sorted((p for p in backup_root.glob("*") if p.is_dir() and (p/"manifest.json").is_file()),key=lambda p:p.name)
+
+def _locale_manifest(ver):
+    """优先返回同版本的最初快照，没有则返回 None。"""
+    for p in _locale_backups():
+        try: m=json.loads((p/"manifest.json").read_text())
+        except Exception: continue
+        if m.get("version")!=ver: continue
+        if all((p/i["backup"]).is_file() for i in m["files"] if i.get("backup")): return p
+    return None
+
 if mode=="--restore":
-    folders=sorted((p for p in backup_root.glob("*") if p.is_dir() and (p/"manifest.json").is_file()),key=lambda p:p.name)
+    folders=_locale_backups()
     if not folders: raise RuntimeError(f"没有可用的安装备份：{backup_root}")
-    folder=folders[-1]; manifest=json.loads((folder/"manifest.json").read_text())
+    keep=_locale_manifest(version)
+    folder=keep or folders[-1]
+    manifest=json.loads((folder/"manifest.json").read_text())
     for item in manifest["files"]:
         dest=Path(item["path"])
         if item["existed"]: shutil.copy2(folder/item["backup"],dest)
         elif dest.exists(): dest.unlink()
-    print("已还原备份：",folder); raise SystemExit(0)
+    print("已还原备份：",folder)
+    # 最初快照保留；同版本其他快照还原后清掉，清空则移除备份目录。
+    try:
+        same=[p for p in folders if p!=keep and json.loads((p/"manifest.json").read_text()).get("version")==version]
+        for p in same:
+            if p==folder: continue
+            shutil.rmtree(p,ignore_errors=True); print("已清理重复备份：",p.name)
+        if folder!=keep:
+            shutil.rmtree(folder); print("已清理备份：",folder.name)
+        if backup_root.is_dir() and not any(p for p in backup_root.iterdir() if p.name!=".DS_Store"):
+            shutil.rmtree(backup_root,ignore_errors=True)
+    except OSError as exc:
+        print(f"警告：备份清理失败，可手动删除（{exc}）")
+    print("已保留最初原版备份：",keep.name) if keep else print("提示：未找到最初原版备份，本次已用其他快照还原。")
+    raise SystemExit(0)
 
 if not changed: print("中文界面已设置，无需再次修改。"); raise SystemExit(0)
 backup_root.mkdir(parents=True,exist_ok=True)
-stamp=datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-backup=backup_root/(stamp+"-Claude-"+version.replace("/","_")); files=backup/"files"; files.mkdir(parents=True)
-manifest={"created":stamp,"app":str(app),"version":version,"files":[]}
-for i,(dest,payload) in enumerate(changed.items()):
-    existed=dest.exists(); saved=f"files/{i:02d}-{dest.name}" if existed else None
-    if existed: shutil.copy2(dest,backup/saved)
-    manifest["files"].append({"path":str(dest),"existed":existed,"backup":saved,"sha256_before":hashlib.sha256(dest.read_bytes()).hexdigest() if existed else None})
-(backup/"manifest.json").write_text(json.dumps(manifest,indent=2)+"\n")
+# 同版本只保留最初一份快照；已存在就不再复制，避免重复留档。
+backup=_locale_manifest(version)
+if backup:
+    print("沿用最初原版备份：",backup)
+    for p in _locale_backups():
+        if p==backup: continue
+        try: same=json.loads((p/"manifest.json").read_text()).get("version")==version
+        except Exception: same=False
+        if same: shutil.rmtree(p,ignore_errors=True); print("已清理重复备份：",p.name)
+else:
+    stamp=datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup=backup_root/(stamp+"-Claude-"+version.replace("/","_")); files=backup/"files"; files.mkdir(parents=True)
+    manifest={"created":stamp,"app":str(app),"version":version,"files":[]}
+    for i,(dest,payload) in enumerate(changed.items()):
+        existed=dest.exists(); saved=f"files/{i:02d}-{dest.name}" if existed else None
+        if existed: shutil.copy2(dest,backup/saved)
+        manifest["files"].append({"path":str(dest),"existed":existed,"backup":saved,"sha256_before":hashlib.sha256(dest.read_bytes()).hexdigest() if existed else None})
+    (backup/"manifest.json").write_text(json.dumps(manifest,indent=2)+"\n")
 def atomic_write(path,payload):
     path.parent.mkdir(parents=True,exist_ok=True); modebits=path.stat().st_mode&0o777 if path.exists() else 0o644
     fd,tmp=tempfile.mkstemp(prefix="."+path.name+".",dir=str(path.parent))
@@ -164,8 +507,74 @@ try:
 except Exception:
     print("安装未完整完成。如需恢复最近一次快照，请重新运行并在菜单中选择“还原”。",file=sys.stderr); raise
 PYINSTALL
+}
+
+# 命令行直通用法：带参数时不进菜单
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        --help|-h|help)
+            printf '%s\n' '用法：claude插件.command [--dry-run|--restore|cu-install|cu-check|cu-restore|--help]' \
+                '不带参数启动时显示菜单并循环，操作完成后可继续选择。' \
+                '--dry-run 预览中文安装；--restore 还原中文备份；' \
+                'cu-install 开启计算机使用；cu-check 查看状态；cu-restore 还原 CU 改动。'
+            exit 0
+            ;;
+        --dry-run|--restore|install|cu-install|cu-check|cu-restore)
+            run_tool "$1"
+            exit $?
+            ;;
+        *)
+            printf '未知参数：%s\n' "$1" >&2
+            exit 2
+            ;;
+    esac
+fi
+
+# 交互菜单：操作完成后返回菜单，直到用户选择 0
+pause_enter() {
+    printf '\n按回车返回菜单…'
+    IFS= read -r _ || true
+}
+
+while true; do
+    printf '\nClaude 简体中文界面工具\n'
+    printf '%s\n' '1) 设置中文' '2) 还原最近一次备份' '3) 开启计算机使用（CU）' \
+        '4) 检查 CU 状态' '5) 还原 CU 改动' '0) 退出'
+    printf '请选择 [1/2/3/4/5/0]: '
+    if ! IFS= read -r choice; then
+        printf '\n未读取到选项，已退出。\n'
+        exit 0
+    fi
+    case "$choice" in
+        1) run_tool install || true; pause_enter ;;
+        2)
+            printf '将还原最近一次安装备份。继续？[y/N]: '
+            if IFS= read -r confirm && [[ "$confirm" =~ ^[Yy]$ ]]; then
+                run_tool --restore || true
+            else
+                printf '已取消还原。\n'
+            fi
+            pause_enter
+            ;;
+        3) run_tool cu-install || true; pause_enter ;;
+        4) run_tool cu-check || true; pause_enter ;;
+        5)
+            printf '将还原 CU 改动前的 app.asar 与 Info.plist。继续？[y/N]: '
+            if IFS= read -r confirm && [[ "$confirm" =~ ^[Yy]$ ]]; then
+                run_tool cu-restore || true
+            else
+                printf '已取消还原。\n'
+            fi
+            pause_enter
+            ;;
+        0) printf '已退出。\n'; exit 0 ;;
+        '') ;;
+        *) printf '选项无效，请输入 1、2、3、4、5 或 0。\n' ;;
+    esac
+done
+
 # BEGIN_ZH_HANS_GZIP_B64
-H4sIAAAAAAAC/6y9aVNbS9Yu+FcU742O6A6qSkIggd44t6JBEhJCgNCAkPr2ByEJzQMakAThDjxg
+H4sIAGRA2moC/6y9aVNbS9Yu+FcU742O6A6qSkIggd44t6JBEhJCgNCAkPr2ByEJzQMakAThDjxg
 g20G++ARPGDj4dhm8LGPzUzE/Sn1siXxqf5C51ord+4t2afqRkdHVNQxyty5c+ewxmetNfcfHR26
 UMA4Hpyy/sd//kdz77u0+V5a+NbcPWuc7l5u/XH57NXFwU5942t9/bC+s325dfhf89f+4y/ssa5R
 XXzW3DPFHqvvvIbHFjek4yNp8aZ09wh7WGKVeK5L54ce698uN25eHD+8ODqSVu9dzl9tHD+pL95r
@@ -20332,185 +20741,313 @@ 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
-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
-9/8Pfehh60bdJgA=
+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
 # END_ZH_HANS_GZIP_B64
 # BEGIN_ZH_HANS_DYNAMIC_GZIP_B64
 H4sIAAAAAAAC/41W2VZaWRD9FZav9GoUQaHfHBCVSUFQ7xsCihomZVB79VqoYYgTJAE1gibGibRL
